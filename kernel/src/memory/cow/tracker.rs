@@ -136,6 +136,12 @@ impl CowTracker {
                 // Slot trouvé — incrémente sous verrou.
                 let rc = entry.ref_count.fetch_add(1, Ordering::Relaxed) + 1;
                 self.inc_count.fetch_add(1, Ordering::Relaxed);
+                #[cfg(target_arch = "x86_64")]
+                crate::memory::physical::allocator::buddy::diag25_trace(
+                    b"<25INC ",
+                    frame.phys_addr().as_u64(),
+                    rc,
+                );
                 return Ok(rc);
             }
             if existing == SLOT_EMPTY {
@@ -151,6 +157,12 @@ impl CowTracker {
                 if collisions > old_max {
                     self.collision_max.store(collisions, Ordering::Relaxed);
                 }
+                #[cfg(target_arch = "x86_64")]
+                crate::memory::physical::allocator::buddy::diag25_trace(
+                    b"<25INS ",
+                    frame.phys_addr().as_u64(),
+                    2,
+                );
                 return Ok(2);
             }
             if existing == SLOT_DELETED && first_tombstone.is_none() {
@@ -198,6 +210,12 @@ impl CowTracker {
                     entry.ref_count.store(0, Ordering::Relaxed);
                     self.tracked_count.fetch_sub(1, Ordering::Relaxed);
                     self.dec_count.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(target_arch = "x86_64")]
+                    crate::memory::physical::allocator::buddy::diag25_trace(
+                        b"<25DECZ old=",
+                        frame.phys_addr().as_u64(),
+                        old,
+                    );
                     return 0;
                 }
                 let new_rc = entry.ref_count.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -207,6 +225,12 @@ impl CowTracker {
                     self.tracked_count.fetch_sub(1, Ordering::Relaxed);
                 }
                 self.dec_count.fetch_add(1, Ordering::Relaxed);
+                #[cfg(target_arch = "x86_64")]
+                crate::memory::physical::allocator::buddy::diag25_trace(
+                    b"<25DEC ",
+                    frame.phys_addr().as_u64(),
+                    new_rc,
+                );
                 return new_rc;
             }
         }

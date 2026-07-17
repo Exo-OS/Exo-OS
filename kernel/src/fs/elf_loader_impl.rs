@@ -11,7 +11,6 @@
 //   - ElfLoadError    : InvalidElf/UnsupportedArch (variants qui existent dans l'enum)
 
 use crate::arch::constants::USER_ELF_BASE_MIN;
-use crate::fs::exofs::cache::blob_cache::BLOB_CACHE;
 use crate::fs::exofs::core::types::BlobId;
 use crate::fs::exofs::syscall::object_store;
 use crate::fs::exofs::syscall::path_resolve::resolve_path_to_blob;
@@ -498,10 +497,18 @@ static ELF_BLOB_CACHE: Mutex<ElfBlobCache> = Mutex::new(ElfBlobCache {
     next: 0,
 });
 
-/// Octets d'un blob ELF : cache ELF dédié → BLOB_CACHE partagé → disque (lu +
-/// hashé UNE seule fois, puis réutilisé pour toutes les fautes de page suivantes).
+/// Octets d'un blob ELF : cache ELF dédié → disque (lu + hashé UNE seule fois,
+/// puis réutilisé pour toutes les fautes de page suivantes).
+///
+/// FIX #25 (Audit 3.4) — On ne consulte PLUS `BLOB_CACHE.get()` du tout.
+/// Raison : chaque `BLOB_CACHE.get()` écrit `last_accessed`/`access_count` sur
+/// un nœud BTreeMap SLUB et peut allouer un `Arc<[u8]>` via
+/// `materialize_snapshot`. Cette pression SLUB pendant le demand-paging ELF
+/// de l'enfant peut forcer le buddy à fournir une page ambiguë. En lisant
+/// directement depuis `object_store::load_blob_data_if_available`, on élimine
+/// la « classe qui persiste » identifiée dans l'audit.
 fn load_blob_cached(blob_id: &BlobId) -> Result<Arc<[u8]>, AllocError> {
-    // 1. Hit dans le cache ELF.
+    // 1. Hit dans le cache ELF dédié (Arc<[u8]> — pas de BTreeMap SLUB).
     {
         let cache = ELF_BLOB_CACHE.lock();
         for slot in cache.slots.iter() {
@@ -512,15 +519,11 @@ fn load_blob_cached(blob_id: &BlobId) -> Result<Arc<[u8]>, AllocError> {
             }
         }
     }
-    // 2. Miss : BLOB_CACHE partagé (lecture seule) puis disque.
-    let arc: Arc<[u8]> = if let Some(cached) = BLOB_CACHE.get(blob_id) {
-        cached
-    } else {
-        let data = object_store::load_blob_data_if_available(blob_id)
-            .map_err(|_| AllocError::InvalidParams)?
-            .ok_or(AllocError::InvalidParams)?;
-        Arc::from(data.into_boxed_slice())
-    };
+    // 2. Miss : lecture directe depuis object_store (PAS de BLOB_CACHE.get()).
+    let data = object_store::load_blob_data_if_available(blob_id)
+        .map_err(|_| AllocError::InvalidParams)?
+        .ok_or(AllocError::InvalidParams)?;
+    let arc: Arc<[u8]> = Arc::from(data.into_boxed_slice());
     // 3. Insertion round-robin (re-vérifie l'absence pour éviter un doublon).
     {
         let mut cache = ELF_BLOB_CACHE.lock();
@@ -551,6 +554,32 @@ impl FileFaultProvider for ExoFsElfLoader {
         let dst_virt = phys_to_virt(dest_frame.start_address());
         let dst =
             unsafe { core::slice::from_raw_parts_mut(dst_virt.as_u64() as *mut u8, PAGE_SIZE) };
+
+        // FIX #25 (Audit 5.1) — Diagnostic défensif : `dst.fill(0)` ci-dessous
+        // est la SEULE écriture physmap PAGE_SIZE sur le chemin live (demand-
+        // paging execve) qui contourne le détecteur ZEROINIT du buddy
+        // (dest_frame est alloué via alloc_nonzeroed, pas ZEROED). Si dest_frame
+        // est corrompu (frame pile d'init vivante), cette écriture zéroe la
+        // page d'init → SEGV rip=0. On vérifie donc ici que dest_frame n'est PAS
+        // une frame de pile d'init avant d'écrire.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::sync::atomic::Ordering;
+            let dest_phys = dest_frame.start_address().as_u64();
+            let mut i = 0usize;
+            while i < 24 {
+                let initf = crate::memory::physical::allocator::buddy::DIAG25_INITF[i]
+                    .load(Ordering::Relaxed);
+                if initf != 0 && initf == dest_phys {
+                    panic!(
+                        "#25 CAUGHT load_file_page: dest_frame={:#x} == DIAG25_INITF[{}]",
+                        dest_phys, i
+                    );
+                }
+                i += 1;
+            }
+        }
+
         dst.fill(0);
 
         let (segments, segment_count) = lookup_elf_segments(file_id);
@@ -615,27 +644,24 @@ fn resolve_blob_id(path_bytes: &[u8]) -> Result<BlobId, ElfLoadError> {
         })
 }
 
-/// Lit le contenu complet d'un blob depuis le cache, puis depuis le disque ExoFS.
+/// Lit le contenu complet d'un blob depuis le disque ExoFS.
+///
+/// FIX #25 (Audit 3.4) — On ne consulte PLUS `BLOB_CACHE.get()` du tout.
+/// Le chargeur ELF lit chaque blob UNE seule fois. L'aller-retour
+/// `insert()+get()` dans BLOB_CACHE est du travail redondant (double stockage,
+/// matérialisation Arc) et — surtout — il place un nœud BTreeMap durable sur
+/// la page heap réutilisée comme tampon DMA virtio (collision DMA/heap qui
+/// corrompt le nœud → memmove géant). De plus, chaque `get()` écrit
+/// `last_accessed`/`access_count` sur le nœud (mutation SLUB) qui crée la
+/// « classe qui persiste » identifiée dans l'audit. On renvoie donc directement
+/// les octets disque sans passer par le cache partagé.
 fn read_blob_from_cache(blob_id: &BlobId) -> Result<Arc<[u8]>, ElfLoadError> {
-    if let Some(data) = BLOB_CACHE.get(blob_id) {
-        trace_blob(b"elf: cache hit ", blob_id);
-        return Ok(data);
-    }
-
-    trace_blob(b"elf: cache miss ", blob_id);
+    trace_blob(b"elf: disk direct ", blob_id);
     let Some(data) =
         object_store::load_blob_data_if_available(blob_id).map_err(|_| ElfLoadError::NotFound)?
     else {
         return Err(ElfLoadError::NotFound);
     };
-
-    // Le chargeur ELF lit chaque blob UNE seule fois : l'aller-retour
-    // insert()+get() dans BLOB_CACHE est du travail redondant (double stockage,
-    // matérialisation Arc) et — surtout — il place un nœud BTreeMap durable sur
-    // la page heap réutilisée comme tampon DMA virtio (collision DMA/heap qui
-    // corrompt le nœud → memmove géant). On renvoie donc directement les octets
-    // disque sans passer par le cache pour ce chemin.
-    trace_blob(b"elf: disk direct ", blob_id);
     Ok(Arc::from(data.into_boxed_slice()))
 }
 
@@ -1021,6 +1047,30 @@ fn write_stack_bytes(
         let page_off = off % PAGE_SIZE;
         let n = (bytes.len() - copied).min(PAGE_SIZE - page_off);
         let dst_virt = phys_to_virt(stack_frames[page_idx].start_address());
+
+        // FIX #25 (Audit 5.2) — Diagnostic défensif : vérifier que
+        // stack_frames[page_idx] n'est PAS une frame de pile d'init vivante.
+        // Si stack_frames (sur la pile noyau de l'enfant) a été corrompu,
+        // write_stack_bytes écrirait via physmap sur une frame d'init →
+        // corruption. On panic pour capturer le coupable.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::sync::atomic::Ordering;
+            let dest_phys = stack_frames[page_idx].start_address().as_u64();
+            let mut i = 0usize;
+            while i < 24 {
+                let initf = crate::memory::physical::allocator::buddy::DIAG25_INITF[i]
+                    .load(Ordering::Relaxed);
+                if initf != 0 && initf == dest_phys {
+                    panic!(
+                        "#25 CAUGHT write_stack_bytes: stack_frames[{}]={:#x} == DIAG25_INITF[{}]",
+                        page_idx, dest_phys, i
+                    );
+                }
+                i += 1;
+            }
+        }
+
         let dst = unsafe {
             core::slice::from_raw_parts_mut((dst_virt.as_u64() as usize + page_off) as *mut u8, n)
         };

@@ -245,6 +245,37 @@ pub fn kalloc(size: usize, flags: AllocFlags) -> Result<NonNull<u8>, AllocError>
     // Obtient l'adresse virtuelle via le physmap.
     let virt_base = phys_to_virt(phys_base);
 
+    // FIX #25 (Audit 1.A) — Sonde <25VMZ> : détecter si vmalloc::kalloc
+    // risque d'écrire (header ou zero-fill) sur une frame de pile d'init
+    // vivante (DIAG25_INITF). C'est le SEUL chemin d'écriture PAGE_SIZE par
+    // physmap qui ne transit pas par `buddy::zero_pages` et échappe donc au
+    // détecteur ZEROINIT. Si `<25VMZ>` apparaît avant un `<SEGV pid=1>`, le
+    // coupable est confirmé.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::Ordering;
+        let pa = phys_base.as_u64();
+        let end = pa.saturating_add((size as u64).saturating_add(64));
+        for i in 0..24usize {
+            let f = crate::memory::physical::allocator::buddy::DIAG25_INITF[i]
+                .load(Ordering::Relaxed);
+            if f != 0 && f >= pa && f < end {
+                use crate::arch::x86_64::terminal::debug_write;
+                use crate::memory::physical::allocator::buddy::{diag25_dec, diag25_hex};
+                debug_write(b"<25VMZ idx=");
+                diag25_dec(i as u64);
+                debug_write(b" ord=");
+                diag25_dec(order as u64);
+                debug_write(b" size=");
+                diag25_dec(size as u64);
+                debug_write(b" phys=");
+                diag25_hex(pa);
+                debug_write(b">\n");
+                break;
+            }
+        }
+    }
+
     // SAFETY: Le physmap couvre intégralement la RAM physique.
     // `virt_base` est le début de la région mappée pour ces frames.
     let header_ptr = virt_base.as_u64() as *mut VmallocHeader;

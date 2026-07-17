@@ -252,6 +252,14 @@ impl BuddyZoneInner {
     }
 }
 
+#[inline(always)]
+fn reserve_frame_descriptor(frame: Frame) {
+    let desc = FRAME_DESCRIPTORS.get(frame);
+    desc.set_flag(FrameFlags::PINNED);
+    desc.set_flag(FrameFlags::RESERVED);
+    desc.clear_flag(FrameFlags::FREE);
+}
+
 impl BuddyZone {
     /// Crée une instance non initialisée.
     pub const fn new_uninit() -> Self {
@@ -444,6 +452,11 @@ impl BuddyZone {
                     }
                 }
                 let frame = Frame::containing(phys);
+                // #25 : détecteur double-alloc au CHOKEPOINT zone — couvre alloc_on_node
+                // (NUMA) et tous les fallbacks, contrairement au wrapper top-level qui
+                // était court-circuité par alloc_on_node.
+                #[cfg(target_arch = "x86_64")]
+                diag25_on_alloc(frame, order);
                 // V-05 / MEM-05 : poser DMA_PINNED sur tous les frames DMA jusqu'à
                 // wait_dma_complete() — protège contre reclaim et swap.
                 if flags.contains(AllocFlags::DMA) || flags.contains(AllocFlags::DMA32) {
@@ -485,6 +498,10 @@ impl BuddyZone {
                             continue;
                         }
                         let popped_pfn = self.phys_to_pfn(phys);
+                        if self.descriptors_range_has_reserved(popped_pfn, 1usize << current_order) {
+                            self.fail_count.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         if !inner.bitmap_range_is_free(popped_pfn, 1usize << current_order) {
                             self.fail_count.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -569,6 +586,34 @@ impl BuddyZone {
         if !is_aligned(zone_relative, PAGE_SIZE << order) {
             self.fail_count.fetch_add(1, Ordering::Relaxed);
             return Err(AllocError::InvalidParams);
+        }
+
+        // FIX #25 (Audit 1.B) — Refuser de libérer une frame marquée RESERVED.
+        // Les frames de pile d'init sont marquées RESERVED dès leur attribution
+        // (via `reserve_frames` dans `map_stack_pages`). Si un chemin corrompu
+        // tente de libérer Fa, le buddy refuse au lieu de remettre Fa en
+        // circulation. Cela ferme la fenêtre de course même si un déséquilibre
+        // de refcount rend Fa « éligible » au free.
+        {
+            let pfn_check = self.phys_to_pfn(phys);
+            let count = 1usize << order;
+            for k in 0..count {
+                let desc = FRAME_DESCRIPTORS.get(self.pfn_to_frame(pfn_check + k));
+                let flags = desc.flags();
+                if flags.contains(FrameFlags::RESERVED) {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        use crate::arch::x86_64::terminal::debug_write;
+                        debug_write(b"<25RSVD-REFUSE f=");
+                        diag25_hex(phys.as_u64());
+                        debug_write(b" ord=");
+                        diag25_dec(order as u64);
+                        debug_write(b">\n");
+                    }
+                    self.fail_count.fetch_add(1, Ordering::Relaxed);
+                    return Err(AllocError::InvalidParams);
+                }
+            }
         }
 
         {
@@ -703,10 +748,8 @@ impl BuddyZone {
     #[inline(always)]
     fn descriptors_range_is_free(&self, pfn: usize, count: usize) -> bool {
         (0..count).all(|i| {
-            FRAME_DESCRIPTORS
-                .get(self.pfn_to_frame(pfn + i))
-                .flags()
-                .contains(FrameFlags::FREE)
+            let flags = FRAME_DESCRIPTORS.get(self.pfn_to_frame(pfn + i)).flags();
+            flags.contains(FrameFlags::FREE) && !flags.contains(FrameFlags::RESERVED)
         })
     }
 
@@ -717,6 +760,16 @@ impl BuddyZone {
                 .get(self.pfn_to_frame(pfn + i))
                 .flags()
                 .contains(FrameFlags::FREE)
+        })
+    }
+
+    #[inline(always)]
+    fn descriptors_range_has_reserved(&self, pfn: usize, count: usize) -> bool {
+        (0..count).any(|i| {
+            FRAME_DESCRIPTORS
+                .get(self.pfn_to_frame(pfn + i))
+                .flags()
+                .contains(FrameFlags::RESERVED)
         })
     }
 
@@ -1061,12 +1114,9 @@ pub static BUDDY: GlobalBuddyAllocator = GlobalBuddyAllocator::new();
 /// Alloue `2^order` pages physiques contiguës.
 #[inline(always)]
 pub fn alloc_pages(order: usize, flags: AllocFlags) -> Result<Frame, AllocError> {
-    let r = BUDDY.alloc_pages(order, flags);
-    #[cfg(target_arch = "x86_64")]
-    if let Ok(f) = r {
-        diag25_on_alloc(f, order);
-    }
-    r
+    // #25 : diag25_on_alloc est désormais au chokepoint BuddyZone::alloc_pages
+    // (couvre alloc_on_node), plus ici, pour éviter le double-marquage.
+    BUDDY.alloc_pages(order, flags)
 }
 
 /// Libère un bloc de `2^order` pages.
@@ -1099,9 +1149,107 @@ static DIAG25_DMA_TAINT: [core::sync::atomic::AtomicU64; 1024] =
 /// CoW-break dans `cow.rs`. Tout `free` de ce frame APRÈS sa capture = libération
 /// erronée du frame VIVANT d'init = cause racine de #25 (le buddy le recycle
 /// ensuite pour une alloc ZEROED de l'execve enfant qui l'écrase à 0). 0 = désarmé.
+// Armé DÈS LE BOOT sur 0x582d000 (F' de ce build) pour capter TOUT le cycle de vie
+// du frame de pile d'init : alloc → [free erroné] → ré-alloc enfant. Le 1er FREEF
+// après l'alloc d'init = la libération fautive (cause racine #25).
 #[cfg(target_arch = "x86_64")]
 pub static DIAG25_WATCH_FRAME: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// DIAG #25 : trace une opération de refcount/free sur le frame surveillé (F').
+/// `tag` doit se terminer par le préfixe ; on émet la valeur décimale puis `>`.
+#[cfg(target_arch = "x86_64")]
+pub fn diag25_trace(tag: &[u8], frame_phys: u64, val: u32) {
+    use core::sync::atomic::Ordering;
+    let wf = DIAG25_WATCH_FRAME.load(Ordering::Relaxed);
+    if wf == 0 || frame_phys != wf {
+        return;
+    }
+    use crate::arch::x86_64::terminal::debug_write;
+    debug_write(tag);
+    diag25_dec(val as u64);
+    debug_write(b">");
+}
+
+/// DIAG #25 : émet `tag` + un u64 en hex + `>` INCONDITIONNELLEMENT (non gardé).
+#[cfg(target_arch = "x86_64")]
+pub fn diag25_hex_always(tag: &[u8], v: u64) {
+    use crate::arch::x86_64::terminal::debug_write;
+    debug_write(tag);
+    diag25_hex(v);
+    debug_write(b">");
+}
+
+// ── DIAG #25 : empreinte des frames de pile d'init (bissection execve) ───────────
+// On capture ~24 frames physiques de la pile d'init au vfork + un checksum pondéré
+// par position. On le re-vérifie entre chaque sous-étape de l'execve enfant : la
+// première étape qui CHANGE le checksum contient l'écriture sauvage (#25).
+#[cfg(target_arch = "x86_64")]
+pub static DIAG25_INITF: [core::sync::atomic::AtomicU64; 24] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 24];
+#[cfg(target_arch = "x86_64")]
+pub static DIAG25_INITSUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_arch = "x86_64")]
+fn diag25_init_sum() -> u64 {
+    use core::sync::atomic::Ordering;
+    let mut s = 0u64;
+    let mut idx = 1u64;
+    for i in 0..24 {
+        let f = DIAG25_INITF[i].load(Ordering::Relaxed);
+        if f == 0 {
+            idx += 512;
+            continue;
+        }
+        let base = phys_to_virt_buddy(PhysAddr::new(f));
+        for w in 0..512u64 {
+            // SAFETY: physmap d'une frame d'init capturée (mappée tout le boot).
+            let v = unsafe { core::ptr::read_volatile((base + (w as usize) * 8) as *const u64) };
+            s = s.wrapping_add(v.wrapping_mul(idx));
+            idx += 1;
+        }
+    }
+    s
+}
+
+/// #25 : enregistre le checksum baseline (appelé au vfork après capture des frames).
+#[cfg(target_arch = "x86_64")]
+pub fn diag25_init_baseline() {
+    use core::sync::atomic::Ordering;
+    DIAG25_INITSUM.store(diag25_init_sum(), Ordering::Relaxed);
+}
+
+/// #25 : vérifie l'intégrité des frames d'init ; émet `<25CORRUPT tag ...>` si changé,
+/// puis re-baseline (ne signale que le PREMIER changement par étape).
+#[cfg(target_arch = "x86_64")]
+pub fn diag25_check_init(tag: &[u8]) {
+    use core::sync::atomic::Ordering;
+    let base = DIAG25_INITSUM.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let now = diag25_init_sum();
+    if now != base {
+        use crate::arch::x86_64::terminal::debug_write;
+        debug_write(b"<25CORRUPT ");
+        debug_write(tag);
+        debug_write(b">");
+        DIAG25_INITSUM.store(now, Ordering::Relaxed);
+    }
+}
+
+/// DIAG #25 : émet `tag` + un u64 en hex + `>` si le détecteur est armé.
+#[cfg(target_arch = "x86_64")]
+pub fn diag25_tag_hex(tag: &[u8], v: u64) {
+    use core::sync::atomic::Ordering;
+    if DIAG25_WATCH_FRAME.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    use crate::arch::x86_64::terminal::debug_write;
+    debug_write(tag);
+    diag25_hex(v);
+    debug_write(b">");
+}
 
 /// Marque les frames d'un tampon DMA comme « tainted » (appelé par le HAL virtio).
 #[cfg(target_arch = "x86_64")]
@@ -1144,6 +1292,27 @@ fn diag25_on_alloc(frame: Frame, order: usize) {
     if dbl {
         diag25_report(b"DBL", frame, order);
     }
+    // FIX #25 (Audit 1.B) — Vérifier DIAG25_INITF au moment de l'alloc.
+    // Si une frame de pile d'init vivante est ré-allouée par le buddy, c'est
+    // le smoking gun d'un `free_pages(Fa)` erroné. On PANIC pour capturer la
+    // chaîne d'appel du coupable (plutôt que de laisser la corruption se
+    // propager silencieusement via `vmalloc::kalloc` ou un autre chemin).
+    {
+        let fp = frame.phys_addr().as_u64();
+        let span = count * 4096;
+        let mut j = 0usize;
+        while j < 24 {
+            let initf = DIAG25_INITF[j].load(Ordering::Relaxed);
+            if initf != 0 && initf >= fp && initf < fp + span {
+                diag25_report(b"REALLOCINIT", frame, order);
+                panic!(
+                    "#25 CAUGHT buddy::alloc_pages: frame={:#x} ord={} chevauche DIAG25_INITF[{}]={:#x} — une frame de pile d'init vivante est ré-allouée",
+                    fp, order, j, initf
+                );
+            }
+            j += 1;
+        }
+    }
     // Une frame ré-allouée alors qu'elle a déjà servi au DMA = candidate à la
     // corruption par écriture DMA tardive (#25). La chaîne d'appel révèle l'usage.
     let mut tainted = false;
@@ -1162,6 +1331,14 @@ fn diag25_on_alloc(frame: Frame, order: usize) {
     if tainted {
         diag25_report(b"TAINT", frame, order);
     }
+    // #25 : tracer chaque alloc du frame surveillé (cycle de vie complet).
+    let wf = DIAG25_WATCH_FRAME.load(Ordering::Relaxed);
+    if wf != 0 {
+        let widx = wf / 4096;
+        if widx >= base && widx < base + count {
+            diag25_report(b"ALLOC", frame, order);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1175,6 +1352,22 @@ fn diag25_on_free(frame: Frame, order: usize) {
     let wf = DIAG25_WATCH_FRAME.load(Ordering::Relaxed);
     if wf != 0 && frame.phys_addr().as_u64() == wf {
         diag25_report(b"FREEF", frame, order);
+    }
+    // #25 : ce free touche-t-il UNE des frames de pile VIVANTE d'init (les 24
+    // capturées au vfork) ? La corruption frappe une page ALÉATOIRE → on surveille
+    // toutes les pages de pile d'init, pas seulement Fa.
+    {
+        let fp = frame.phys_addr().as_u64();
+        let span = count * 4096;
+        let mut j = 0usize;
+        while j < 24 {
+            let initf = DIAG25_INITF[j].load(Ordering::Relaxed);
+            if initf != 0 && initf >= fp && initf < fp + span {
+                diag25_report(b"FREEINIT", frame, order);
+                break;
+            }
+            j += 1;
+        }
     }
     let mut k = 0u64;
     while k < count {
@@ -1219,7 +1412,7 @@ fn diag25_report(tag: &[u8], frame: Frame, order: usize) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn diag25_hex(mut v: u64) {
+pub fn diag25_hex(mut v: u64) {
     use crate::arch::x86_64::terminal::debug_write;
     let mut buf = [0u8; 16];
     let mut i = 16usize;
@@ -1233,7 +1426,7 @@ fn diag25_hex(mut v: u64) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn diag25_dec(mut v: u64) {
+pub fn diag25_dec(mut v: u64) {
     use crate::arch::x86_64::terminal::debug_write;
     let mut buf = [0u8; 20];
     let mut pos = 20usize;
@@ -1259,6 +1452,23 @@ pub fn alloc_page(flags: AllocFlags) -> Result<Frame, AllocError> {
 #[inline(always)]
 pub fn free_page(frame: Frame) -> Result<(), AllocError> {
     free_pages(frame, 0)
+}
+
+/// Réserve un frame physique contre toute libération/réallocation buddy.
+///
+/// Le frame reste utilisable par ses mappings existants, mais le buddy
+/// refusera ensuite toute tentative de free/reuse.
+#[inline(always)]
+pub fn reserve_frame(frame: Frame) {
+    reserve_frame_descriptor(frame);
+}
+
+/// Réserve une série de frames physiques contiguës.
+#[inline(always)]
+pub fn reserve_frames(frames: &[Frame]) {
+    for &frame in frames {
+        reserve_frame_descriptor(frame);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1289,6 +1499,25 @@ fn virt_to_phys_buddy(virt: usize) -> PhysAddr {
 #[inline]
 unsafe fn zero_pages(phys: PhysAddr, order: usize) {
     let size = PAGE_SIZE << order;
+    // #25 : zero_pages va-t-il écraser Fa (pile VIVANTE d'init) ? Si le frame
+    // surveillé est dans la plage zéroée APRÈS l'armement (vfork) → corruption :
+    // le buddy a re-remis Fa en circulation pour une alloc ZEROED. La chaîne révèle
+    // l'appelant (execve enfant ? FS blob ?).
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::Ordering;
+        let lo = phys.as_u64();
+        let hi = lo + size as u64;
+        let mut j = 0usize;
+        while j < 24 {
+            let initf = DIAG25_INITF[j].load(Ordering::Relaxed);
+            if initf != 0 && initf >= lo && initf < hi {
+                diag25_report(b"ZEROINIT", Frame::containing(phys), order);
+                break;
+            }
+            j += 1;
+        }
+    }
     let virt = phys_to_virt_buddy(phys) as *mut u8;
     // SAFETY: Les pages sont allouées et mappées en physmap.
     core::ptr::write_bytes(virt, 0, size);

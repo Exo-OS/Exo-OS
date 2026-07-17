@@ -195,6 +195,30 @@ pub unsafe fn spawn_service(service_name: &str, bin_path: &[u8]) -> u32 {
     if !owns_interactive_console(service_name) {
         log::service_pid(b"init: spawned ", service_name, child_pid as u32);
     }
+
+    // FIX #25 (Audit 4.1) — Barrière post-execve : bloquer init pendant que
+    // l'enfant termine son démarrage utilisateur (demand-paging .text +
+    // IPC_REGISTER). Sans cette barrière, init reprend immédiatement après
+    // l'execve de l'enfant et la course de co-planification peut corrompre
+    // une frame vivante d'init (validé expérimentalement session 2026-06-21 :
+    // 500 ms fait progresser init de 1→2 services au lieu d'un seul).
+    // Le shell `exosh` est exempté car c'est le service terminal — aucun spawn
+    // supplémentaire n'a lieu après lui, donc la barrière n'apporterait rien
+    // et ralentirait l'accès au shell.
+    if !owns_interactive_console(service_name) {
+        let stabilise = Timespec {
+            tv_sec: 0,
+            tv_nsec: 500_000_000, // 500 ms — validé session 2026-06-21
+        };
+        let _ = unsafe {
+            syscall::syscall2(
+                syscall::SYS_NANOSLEEP,
+                &stabilise as *const Timespec as u64,
+                0,
+            )
+        };
+    }
+
     child_pid as u32
 }
 

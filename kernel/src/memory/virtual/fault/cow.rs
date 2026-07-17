@@ -81,6 +81,29 @@ pub fn handle_cow_fault<A: FaultAllocator>(
 
     // Copier les données de l'ancien frame vers le nouveau.
     // SAFETY: Les deux frames sont mappés dans le physmap kernel.
+    //
+    // FIX #25 (Audit 5.3) — Diagnostic défensif : vérifier que new_frame n'est
+    // PAS une frame de pile d'init vivante. Si new_frame (alloué via
+    // alloc_nonzeroed) a été corrompu, ou si le buddy a retourné une frame
+    // vivante d'init, cette copie écraserait le contenu de la page d'init. On
+    // panic pour capturer le coupable.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::Ordering;
+        let dst_phys = new_frame.start_address().as_u64();
+        let mut i = 0usize;
+        while i < 24 {
+            let initf = crate::memory::physical::allocator::buddy::DIAG25_INITF[i]
+                .load(Ordering::Relaxed);
+            if initf != 0 && initf == dst_phys {
+                panic!(
+                    "#25 CAUGHT handle_cow_fault: new_frame={:#x} == DIAG25_INITF[{}]",
+                    dst_phys, i
+                );
+            }
+            i += 1;
+        }
+    }
     unsafe {
         let src = (crate::memory::core::layout::PHYS_MAP_BASE.as_u64()
             + old_frame.start_address().as_u64()) as *const u8;
@@ -113,16 +136,16 @@ pub fn handle_cow_fault<A: FaultAllocator>(
                 diag_f25_hex(page_addr.as_u64());
                 debug_write(b" f=");
                 diag_f25_hex(new_frame.start_address().as_u64());
-                debug_write(b">");
-                // #25 : armer le détecteur de free sur le frame F' de CETTE page de
-                // pile d'init (celle qui contient le slot 0xae8 corrompu). Si ce
-                // frame VIVANT est libéré ensuite → cause racine (diag25 « FREEF »).
-                if page_addr.as_u64() == 0x7fff_fffe_f000 {
-                    crate::memory::physical::allocator::buddy::DIAG25_WATCH_FRAME.store(
-                        new_frame.start_address().as_u64(),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                debug_write(b" cr3=");
+                // SAFETY: lecture du registre CR3 — aucun accès mémoire (nomem correct,
+                // contrairement à gs:[..]). Permet de distinguer la cassure CoW d'init
+                // (cr3 = AS d'init) de celle de l'enfant pour cibler le watchpoint #25.
+                let cr3v: u64;
+                unsafe {
+                    core::arch::asm!("mov {}, cr3", out(reg) cr3v, options(nomem, nostack));
                 }
+                diag_f25_hex(cr3v);
+                debug_write(b">");
             }
             FaultResult::Handled
         }

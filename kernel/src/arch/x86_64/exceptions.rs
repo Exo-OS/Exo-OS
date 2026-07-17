@@ -1030,12 +1030,15 @@ extern "C" fn do_page_fault(frame: *mut ExceptionFrame) {
                     // binaire statique → détecte une corruption du .text d'init.
                     out(b" ripb=");
                     let mut rb = 0u64;
-                    // SAFETY: page RIP présente (fetch réussi) ; KPTI off → mappée
-                    // dans le CR3 courant ; lecture volatile de 8 octets user.
-                    for bi in 0..8u64 {
-                        let byte =
-                            unsafe { core::ptr::read_volatile((frame.rip + bi) as *const u8) };
-                        rb |= (byte as u64) << (bi * 8);
+                    // SAFETY: lecture GARDÉE — uniquement si RIP est une adresse user
+                    // plausible. Sinon lire (p.ex. RIP=0x130) re-fault en KERNEL et
+                    // déclenche une résurrection ExoPhoenix (perte du dump #25).
+                    if frame.rip >= 0x1000 && frame.rip < 0x0000_8000_0000_0000 {
+                        for bi in 0..8u64 {
+                            let byte =
+                                unsafe { core::ptr::read_volatile((frame.rip + bi) as *const u8) };
+                            rb |= (byte as u64) << (bi * 8);
+                        }
                     }
                     out(&hex(rb));
                     // DIAG-25 : contexte GP complet — révèle si les registres d'init
@@ -1060,6 +1063,19 @@ extern "C" fn do_page_fault(frame: *mut ExceptionFrame) {
                     out(&hex(frame.ss));
                     out(b" rfl=");
                     out(&hex(frame.rflags));
+                    // DIAG-25 : 8 mots de la pile user à RSP — révèle la chaîne de
+                    // retour (d'où provient le saut vers le RIP corrompu).
+                    out(b" stk=");
+                    if frame.rsp >= 0x1000 && frame.rsp < 0x0000_8000_0000_0000 {
+                        for wi in 0..8u64 {
+                            // SAFETY: RSP user plausible ; KPTI off ; lecture volatile.
+                            let w = unsafe {
+                                core::ptr::read_volatile((frame.rsp + wi * 8) as *const u64)
+                            };
+                            out(&hex(w));
+                            out(b" ");
+                        }
+                    }
                     out(b">\n");
                 }
                 crate::security::shield_feed::push_event(

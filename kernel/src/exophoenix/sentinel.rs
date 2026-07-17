@@ -29,7 +29,15 @@ const SCORE_PMC_ANOMALY: u32 = 10;
 const THREAT_THRESHOLD: u32 = 100;
 
 const B_REGION_PHYS_BASE: u64 = KERNEL_LOAD_PHYS_ADDR;
-const B_REGION_PHYS_END: u64 = KERNEL_LOAD_PHYS_ADDR + KERNEL_IMAGE_MAX_SIZE as u64;
+// FIX #25 (Audit 6.2) — `KERNEL_IMAGE_MAX_SIZE` (2 GiB) est une borne haute de
+// budget de lien, PAS la taille réelle de l'image chargée. L'ancien code
+// retournait `true` pour toute adresse physique entre 1 Mio et ~2049 Mio, soit
+// la quasi-totalité de la RAM allouée par le buddy. Maintenant on calcule la
+// taille réelle via le symbole linker `__kernel_end` (lazy-init dans
+// `b_region_phys_end()`). On garde un plafond prudent sur
+// `KERNEL_IMAGE_MAX_SIZE` uniquement si `__kernel_end` est absent ou invalide
+// (fallback défensif).
+static B_REGION_PHYS_END: AtomicU64 = AtomicU64::new(0);
 
 const SSR_CMD_PHYS_START: u64 = ssr::SSR_BASE + ssr::SSR_CMD_B2A as u64;
 const SSR_CMD_PHYS_END: u64 = SSR_CMD_PHYS_START + 64;
@@ -50,6 +58,51 @@ static PMC_BASELINE: [AtomicU64; 4] = [
     AtomicU64::new(0),
 ];
 static PMC_BASELINE_SET: AtomicBool = AtomicBool::new(false);
+
+/// FIX #25 (Audit 6.2) — Calcule la taille RÉELLE de l'image kernel chargée
+/// via le symbole linker `__kernel_end`. Retourne la taille en octets, bornée
+/// par `KERNEL_IMAGE_MAX_SIZE` par sécurité (fallback défensif si le symbole
+/// est absent ou incohérent).
+fn real_kernel_image_size() -> usize {
+    // Symbole linker fourni par le linker script kernel.
+    extern "C" {
+        static __kernel_end: u8;
+    }
+    // Lecture purement adresse — pas de déréférencement.
+    let end_addr = (&raw const __kernel_end) as usize as u64;
+    let start_addr = KERNEL_LOAD_PHYS_ADDR;
+    if end_addr > start_addr {
+        let size = (end_addr - start_addr) as usize;
+        // Plafond défensif pour éviter toute régression si le symbole linker
+        // venait à mal se résoudre (borne haute de budget de lien).
+        if size < KERNEL_IMAGE_MAX_SIZE {
+            size
+        } else {
+            KERNEL_IMAGE_MAX_SIZE
+        }
+    } else {
+        // Fallback : borne haute conservatrice.
+        KERNEL_IMAGE_MAX_SIZE
+    }
+}
+
+/// Retourne `B_REGION_PHYS_END`, en l'initialisant paresseusement à la première
+/// invocation via `real_kernel_image_size()`. Once-init simple via CAS.
+#[inline(always)]
+fn b_region_phys_end() -> u64 {
+    let cached = B_REGION_PHYS_END.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+    let computed = KERNEL_LOAD_PHYS_ADDR + real_kernel_image_size() as u64;
+    let _ = B_REGION_PHYS_END.compare_exchange(
+        0,
+        computed,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
+    B_REGION_PHYS_END.load(Ordering::Acquire)
+}
 
 #[inline(always)]
 fn read_apic_timestamp_ticks() -> u32 {
@@ -77,7 +130,7 @@ fn is_b_region(pa: u64) -> bool {
     let pool_r3_base = stage0::pool_r3_base_phys();
     let pool_r3_end = pool_r3_base.saturating_add(stage0::pool_r3_alloc_bytes());
 
-    let in_b_region = pa >= B_REGION_PHYS_BASE && pa < B_REGION_PHYS_END;
+    let in_b_region = pa >= B_REGION_PHYS_BASE && pa < b_region_phys_end();
     let in_pool_r3 = pa >= pool_r3_base && pa < pool_r3_end;
     let in_ssr_cmd = pa >= SSR_CMD_PHYS_START && pa < SSR_CMD_PHYS_END;
 

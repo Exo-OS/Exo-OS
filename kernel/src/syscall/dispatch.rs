@@ -699,6 +699,16 @@ fn handle_fork_like_inplace(
         user_r9: frame.r9,
     };
 
+    // #25 : empreinte de la SyscallFrame d'init AVANT le blocage vfork. Comparée à
+    // l'empreinte APRÈS resume : toute différence = corruption du contexte sauvé
+    // d'init pendant l'execve de l'enfant (cause racine #25).
+    #[cfg(target_arch = "x86_64")]
+    if fork_flags.has(crate::process::lifecycle::fork::ForkFlags::VFORK) {
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b"<25SFpre rcx=", frame.rcx);
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" rsp=", frame.rsp);
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" rbp=", frame.rbp);
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" rbx=", frame.rbx);
+    }
     match do_fork(&ctx) {
         Ok(result) => {
             syscall_trace(b"sys_fork: do_fork ok\n");
@@ -708,6 +718,16 @@ fn handle_fork_like_inplace(
                 let tcb_mut = unsafe { &mut *(tcb_ptr as *mut ThreadControlBlock) };
                 if wait_for_vfork_completion(result.child_pid, tcb_mut).is_err() {
                     return EINTR;
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::memory::physical::allocator::buddy::diag25_hex_always(
+                        b"<25SFpost rcx=",
+                        frame.rcx,
+                    );
+                    crate::memory::physical::allocator::buddy::diag25_hex_always(b" rsp=", frame.rsp);
+                    crate::memory::physical::allocator::buddy::diag25_hex_always(b" rbp=", frame.rbp);
+                    crate::memory::physical::allocator::buddy::diag25_hex_always(b" rbx=", frame.rbx);
                 }
             }
             result.child_pid.0 as i64

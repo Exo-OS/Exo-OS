@@ -331,6 +331,12 @@ unsafe fn clone_pt(
                 continue;
             }
             if let Some(frame) = src_entry.frame() {
+                #[cfg(target_arch = "x86_64")]
+                crate::memory::physical::allocator::buddy::diag25_trace(
+                    b"<25CLPT ",
+                    frame.phys_addr().as_u64(),
+                    1,
+                );
                 track_cow_frame(frame)?;
             }
             let shared = shared_leaf_entry(src_entry);
@@ -343,7 +349,17 @@ unsafe fn clone_pt(
 
 #[inline]
 fn shared_leaf_entry(src_entry: PageTableEntry) -> PageTableEntry {
-    if src_entry.is_writable() || src_entry.is_cow() {
+    // FIX #25 (Audit 3.3) — Poser FLAG_COW sur TOUTE entrée leaf présente+user
+    // (y compris les pages RO comme le code ELF), au lieu de ne le faire que
+    // pour les pages writable ou déjà-CoW.
+    //
+    // Sans FLAG_COW, la condition `will_free = (remaining == u32::MAX && !cow)`
+    // pourrait devenir VRAIE pour un frame RO partagé si un déséquilibre de
+    // refcount le rend untracked — le teardown libérerait alors une frame
+    // encore utilisée par init. Avec FLAG_COW systématique, `!cow` est
+    // toujours false pour un frame partagé → le teardown fuit (leak) plutôt
+    // que de corrompre init. Le leak est non-fatal et détectable.
+    if src_entry.is_present() && src_entry.is_user() {
         PageTableEntry::from_raw(
             (src_entry.raw() & !PageTableEntry::FLAG_WRITABLE) | PageTableEntry::FLAG_COW,
         )
@@ -364,6 +380,11 @@ fn repoint_table_entry(src_entry: PageTableEntry, new_phys: PhysAddr) -> PageTab
 }
 
 unsafe fn free_userspace_tables(root_pml4_phys: PhysAddr) {
+    #[cfg(target_arch = "x86_64")]
+    crate::memory::physical::allocator::buddy::diag25_tag_hex(
+        b"<25TD pml4=",
+        root_pml4_phys.as_u64(),
+    );
     let pml4 = phys_to_table_ref(root_pml4_phys);
     for l4_idx in 0..256 {
         let entry = pml4[l4_idx];
@@ -432,7 +453,45 @@ fn release_leaf_frame(entry: PageTableEntry) {
         return;
     };
     let remaining = COW_TRACKER.dec(frame);
-    if remaining == 0 || (remaining == u32::MAX && !entry.is_cow()) {
+    let will_free = remaining == u32::MAX && !entry.is_cow();
+    // #25 : ne jamais libérer un frame encore marqué CoW. Si le comptage tombe à 0
+    // alors que l'entrée est toujours CoW, on préfère fuiter plutôt que réallouer
+    // un frame potentiellement encore visible par le parent.
+    #[cfg(target_arch = "x86_64")]
+    if will_free && entry.is_cow() {
+        crate::memory::physical::allocator::buddy::diag25_hex_always(
+            b"<25TDCF f=",
+            frame.phys_addr().as_u64(),
+        );
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" rem=", remaining as u64);
+    }
+    // FIX #25 (Audit 3.5) — Guard DIAG25_INITF avant buddy::free_pages.
+    // Defense-in-depth runtime : si, malgré les fixes 2.1/2.2/3.3, un
+    // déséquilibre de refcount rendait un frame init « éligible » au free,
+    // ce guard l'empêche physiquement. On émet `<25GUARD-LEAK>` et on fuit
+    // volontairement le frame (non-fatal, détectable dans les stats buddy).
+    #[cfg(target_arch = "x86_64")]
+    if will_free {
+        use core::sync::atomic::Ordering;
+        let fp = frame.phys_addr().as_u64();
+        let mut j = 0usize;
+        while j < 24 {
+            let initf = crate::memory::physical::allocator::buddy::DIAG25_INITF[j]
+                .load(Ordering::Relaxed);
+            if initf != 0 && initf == fp {
+                use crate::arch::x86_64::terminal::debug_write;
+                use crate::memory::physical::allocator::buddy::{diag25_dec, diag25_hex};
+                debug_write(b"<25GUARD-LEAK f=");
+                diag25_hex(fp);
+                debug_write(b" rem=");
+                diag25_dec(remaining as u64);
+                debug_write(b">\n");
+                return; // NE PAS libérer — fuite volontaire
+            }
+            j += 1;
+        }
+    }
+    if will_free {
         let _ = buddy::free_pages(frame, 0);
     }
 }
@@ -442,7 +501,32 @@ fn release_huge_frame(entry: PageTableEntry, order: usize) {
         return;
     };
     let remaining = COW_TRACKER.dec(frame);
-    if remaining == 0 || (remaining == u32::MAX && !entry.is_cow()) {
+    if remaining == u32::MAX && !entry.is_cow() {
+        // FIX #25 (Audit 3.5) — Même guard DIAG25_INITF pour les huge frames.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::sync::atomic::Ordering;
+            let fp = frame.phys_addr().as_u64();
+            let span = (4096usize << order) as u64;
+            let mut j = 0usize;
+            while j < 24 {
+                let initf = crate::memory::physical::allocator::buddy::DIAG25_INITF[j]
+                    .load(Ordering::Relaxed);
+                if initf != 0 && initf >= fp && initf < fp + span {
+                    use crate::arch::x86_64::terminal::debug_write;
+                    use crate::memory::physical::allocator::buddy::{diag25_dec, diag25_hex};
+                    debug_write(b"<25GUARD-LEAK-HUGE f=");
+                    diag25_hex(fp);
+                    debug_write(b" ord=");
+                    diag25_dec(order as u64);
+                    debug_write(b" rem=");
+                    diag25_dec(remaining as u64);
+                    debug_write(b">\n");
+                    return; // NE PAS libérer — fuite volontaire
+                }
+                j += 1;
+            }
+        }
         let _ = buddy::free_pages(frame, order);
     }
 }
@@ -471,7 +555,10 @@ mod tests {
     }
 
     #[test]
-    fn shared_entry_preserves_read_only_mapping_without_cow() {
+    fn shared_entry_preserves_read_only_mapping_with_cow_flag() {
+        // FIX #25 (Audit 3.3) — Les pages RO partagées portent désormais
+        // FLAG_COW systématiquement (défense en profondeur contre la
+        // libération de frames partagés par le teardown).
         let frame = Frame::containing(PhysAddr::new(0x24_000));
         let entry = PageTableEntry::new(
             frame,
@@ -482,7 +569,7 @@ mod tests {
 
         assert!(shared.is_present());
         assert!(shared.is_user());
-        assert!(!shared.is_cow());
+        assert!(shared.is_cow()); // ← maintenant FLAG_COW posé
         assert!(!shared.is_writable());
         assert_eq!(shared.phys_addr().as_u64(), entry.phys_addr().as_u64());
     }

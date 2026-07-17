@@ -22,10 +22,9 @@
 //! - capability/ ∈ security/ uniquement (DOC1 RÈGLE CAP-01)
 //! - futex ∈ memory/utils/futex_table.rs (DOC3 RÈGLE SCHED-03)
 
-#![cfg_attr(all(any(not(test), target_os = "none"), not(kani)), no_std)]
+#![cfg_attr(all(target_os = "none", not(kani)), no_std)]
 #![allow(binary_asm_labels)]
 #![allow(unexpected_cfgs)]
-#![cfg_attr(all(not(test), not(kani)), feature(alloc_error_handler))]
 
 #[cfg(all(not(target_arch = "x86_64"), not(test)))]
 compile_error!("ExoOS kernel v0.2.0 supporte uniquement x86_64 comme cible de boot.");
@@ -354,7 +353,7 @@ pub unsafe fn kernel_init(cpu_count: usize) {
     crate::arch::x86_64::boot_display::stage_ok("FS");
 }
 
-#[cfg(all(not(test), not(kani)))]
+#[cfg(all(target_os = "none", not(kani)))]
 #[panic_handler]
 fn kernel_panic(info: &core::panic::PanicInfo) -> ! {
     // BUG-5 FIX: l'ancien handler effectuait un halt silencieux sans aucun diagnostic.
@@ -411,7 +410,7 @@ fn kernel_panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
-#[cfg(all(not(test), not(kani)))]
+#[cfg(all(target_os = "none", not(kani)))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
     // BUG-5 FIX: même correction — affiche taille/alignement sur port 0xE9 QEMU.

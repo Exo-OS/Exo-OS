@@ -260,6 +260,9 @@ pub fn do_execve(
             return Err(ExecError::ElfLoadFailed(err));
         }
     };
+    // #25 : bissection — la pile d'init est-elle déjà corrompue après load_elf ?
+    #[cfg(target_arch = "x86_64")]
+    crate::memory::physical::allocator::buddy::diag25_check_init(b"postelf");
 
     // FIX-EXEC-SIG (Security_Audit_Passe2 §C-01) : vérification de la signature
     // du module avant remplacement de l'espace d'adressage.
@@ -354,6 +357,25 @@ pub fn do_execve(
 
     // Mettre à jour l'espace d'adressage dans le TCB scheduler.
     thread.sched_tcb.cr3_phys = elf_result.cr3;
+    // FIX #25 (Audit 6.1) — Libérer l'ancienne shadow PML4 KPTI avant de
+    // l'écraser. Sans cette libération, chaque `fork()`+`execve()` orpheline
+    // une page physique de 4 KiB. Sur le boot (~10 services), c'est négligeable,
+    // mais c'est une vraie fuite à corriger (et ça évite de mélanger les
+    // symptômes lors d'investigations KPTI futures).
+    {
+        let old_kpti_cr3 = thread.sched_tcb.kpti_user_cr3();
+        if old_kpti_cr3 != 0 && old_kpti_cr3 != exec_kpti_user_cr3 {
+            // SAFETY: l'ancienne shadow PML4 a été allouée via
+            // `build_user_shadow_pml4` (lui-même `buddy::alloc_page(ZEROED)`).
+            // Elle n'est plus référencée nulle part après ce point.
+            let _ = crate::memory::physical::allocator::buddy::free_pages(
+                crate::memory::core::Frame::containing(
+                    crate::memory::core::PhysAddr::new(old_kpti_cr3),
+                ),
+                0,
+            );
+        }
+    }
     thread.sched_tcb.set_kpti_user_cr3(exec_kpti_user_cr3);
     thread.sched_tcb.fs_base = elf_result.tls_base;
     thread.sched_tcb.user_gs_base = 0;
@@ -399,6 +421,9 @@ pub fn do_execve(
         }
         crate::arch::x86_64::write_cr3(elf_result.cr3);
     }
+    // #25 : bissection — corruption pendant load_elf+switch CR3 ?
+    #[cfg(target_arch = "x86_64")]
+    crate::memory::physical::allocator::buddy::diag25_check_init(b"postcr3");
 
     // BUG-04 / PROC-01 fix: écrire IA32_FS_BASE MSR immédiatement.
     // do_execve() s'exécute en contexte kernel sur le CPU courant du thread ;
@@ -430,11 +455,9 @@ pub fn do_execve(
         .store(elf_result.brk_start, Ordering::Release);
     pcb.set_name_from_path(path.as_bytes());
 
-    // Marquer EXEC_DONE et retirer FORKED.
-    pcb.flags.fetch_or(
-        process_flags::EXEC_DONE | process_flags::VFORK_DONE,
-        Ordering::Release,
-    );
+    // Retirer FORKED/VFORK_SHARED_AS maintenant, mais ne publier EXEC_DONE/VFORK_DONE
+    // qu'après le teardown de l'ancien address space : le parent vfork ne doit pas
+    // pouvoir reprendre pendant `free_addr_space()`.
     pcb.flags.fetch_and(
         !(process_flags::FORKED | process_flags::VFORK_SHARED_AS),
         Ordering::Release,
@@ -443,6 +466,14 @@ pub fn do_execve(
     if old_as_ptr != 0 && old_as_ptr != elf_result.addr_space_ptr && !old_as_is_vfork_shared {
         crate::memory::virt::address_space::fork_impl::KERNEL_AS_CLONER.free_addr_space(old_as_ptr);
     }
+    // #25 : bissection — corruption pendant le teardown de l'ancien AS enfant ?
+    #[cfg(target_arch = "x86_64")]
+    crate::memory::physical::allocator::buddy::diag25_check_init(b"postTD");
+
+    pcb.flags.fetch_or(
+        process_flags::EXEC_DONE | process_flags::VFORK_DONE,
+        Ordering::Release,
+    );
 
     // Transition vers Running.
     pcb.set_state(ProcessState::Running);

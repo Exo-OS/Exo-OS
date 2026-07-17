@@ -99,10 +99,7 @@ pub fn wait_for_vfork_completion(
     caller_tcb: &mut ThreadControlBlock,
 ) -> Result<(), ()> {
     while !vfork_completion_reached(child_pid) {
-        let woke = unsafe { VFORK_WAIT_QUEUE.wait_interruptible(caller_tcb as *mut _) };
-        if !woke && !vfork_completion_reached(child_pid) {
-            return Err(());
-        }
+        let _ = unsafe { VFORK_WAIT_QUEUE.wait_interruptible(caller_tcb as *mut _) };
     }
     Ok(())
 }
@@ -373,6 +370,69 @@ pub fn do_fork(ctx: &ForkContext<'_>) -> Result<ForkResult, ForkError> {
         })?
     };
     fork_trace(b"fork: clone-as done\n");
+    #[cfg(target_arch = "x86_64")]
+    if ctx.flags.has(ForkFlags::VFORK) {
+        crate::memory::physical::allocator::buddy::diag25_hex_always(
+            b"<25VF share=",
+            shares_address_space as u64,
+        );
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" ccr3=", cloned_as.cr3);
+        crate::memory::physical::allocator::buddy::diag25_hex_always(b" pcr3=", parent_cr3);
+        // #25 : capturer ~24 frames physiques de la pile d'init (parent) + checksum
+        // baseline, pour BISSECTER l'execve enfant. diag25_check_init() re-vérifie
+        // entre chaque sous-étape ; la 1re étape qui change le checksum = l'écriture
+        // sauvage qui corrompt la pile VIVANTE d'init (#25).
+        if parent_space_ptr != 0 {
+            // SAFETY: parent_space_ptr publié par le PCB du parent, vivant ici.
+            let pas = unsafe {
+                &*(parent_space_ptr as *const crate::memory::virt::UserAddressSpace)
+            };
+            let mut k = 0u64;
+            while k < 24 {
+                let va = 0x7fff_ffff_0000u64.wrapping_sub(k * 0x1000);
+                let f = pas
+                    .translate(crate::memory::core::VirtAddr::new(va))
+                    .map(|p| p.as_u64() & !0xfffu64)
+                    .unwrap_or(0);
+                crate::memory::physical::allocator::buddy::DIAG25_INITF[k as usize]
+                    .store(f, core::sync::atomic::Ordering::Relaxed);
+                k += 1;
+            }
+            let mut k = 0usize;
+            while k < 24 {
+                let f = crate::memory::physical::allocator::buddy::DIAG25_INITF[k]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if f != 0 {
+                    crate::memory::physical::allocator::buddy::reserve_frame(
+                        crate::memory::core::Frame::containing(
+                            crate::memory::core::PhysAddr::new(f),
+                        ),
+                    );
+                }
+                k += 1;
+            }
+            crate::memory::physical::allocator::buddy::diag25_init_baseline();
+            // #25 : émet Fa = frame de la 1re page de pile d'init (0x7ffffffef000),
+            // celle qui contient l'adresse de retour corrompue. init RESTAURE Fa en
+            // place (refcount=1 après execve enfant) donc Fa reste stable et n'émet
+            // PAS de <F25> (chemin copy). C'est CE frame qu'il faut surveiller.
+            crate::memory::physical::allocator::buddy::diag25_hex_always(
+                b"<25FA ",
+                crate::memory::physical::allocator::buddy::DIAG25_INITF[1]
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
+            // #25 : armer le détecteur FREE/ZERO sur Fa (pile VIVANTE d'init). Tout
+            // free OU zero_pages de Fa APRÈS ce point = corruption (FREEF/ZEROFA + chaîne).
+            {
+                let fa = crate::memory::physical::allocator::buddy::DIAG25_INITF[1]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if fa != 0 {
+                    crate::memory::physical::allocator::buddy::DIAG25_WATCH_FRAME
+                        .store(fa, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
     #[cfg(all(target_arch = "x86_64", debug_assertions, exo_kernel_trace))]
     {
         fork_debug_parent(b"fork_dbg: after_clone", parent, parent_pcb);

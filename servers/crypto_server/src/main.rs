@@ -9,7 +9,6 @@
 
 extern crate blake3;
 
-use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -1010,6 +1009,7 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
+#[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     boot_log(b"crypto_server: panic\n");
