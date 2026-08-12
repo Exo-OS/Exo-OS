@@ -104,19 +104,16 @@ xmas-elf = { version = "0.10", default-features = false }
 
 # IPC
 postcard = { version = "1", default-features = false, features = ["alloc"] }
-smoltcp = { path = "libs/vendors/smoltcp-upstream", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-raw", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-raw", "socket-tcp", "socket-udp"] }
 
 # Logging
-log = { path = "libs/vendors/log-upstream", default-features = false }
+log = { version = "0.4", default-features = false }
 
 # Tests
 proptest          = { version = "1", default-features = false, features = ["alloc"] }
 static_assertions = { version = "1" }
 # Requis pour proptest en no_std (float samplers via feature libm)
 num-traits        = { version = "0.2", default-features = false, features = ["libm"] }
-
-[patch.crates-io]
-log = { path = "libs/vendors/log-upstream" }
 
 [profile.dev]
 opt-level     = 0
