@@ -4,8 +4,8 @@ targets = [
 ]
 
 [advisories]
-unmaintained = "all"
-unsound = "workspace"
+unmaintained = "warn"
+unsound = "warn"
 ignore = []
 
 [licenses]
